@@ -1,158 +1,295 @@
+"""Local, review-first PDF title renamer.
+
+The command only changes files when --apply is explicitly supplied.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
 import re
-import fitz  # PyMuPDF for better text extraction
+import sys
 import unicodedata
-import logging
+from dataclasses import dataclass
 from pathlib import Path
-from collections import defaultdict
-from PyPDF2 import PdfReader
+from typing import Iterable
 
-# Configure logging for debugging and tracking
-logging.basicConfig(filename='pdf_renaming.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import fitz
 
-# Maximum filename length (Windows: 255, Linux/macOS: ~255)
-MAX_FILENAME_LENGTH = 100  
+MAX_TITLE_BYTES = 160
+INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+WHITESPACE = re.compile(r"\s+")
+WINDOWS_DEVICES = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.I)
+BAD_TITLES = {
+    "untitled", "title", "paper title", "document", "document1",
+    "microsoft word", "draft", "abstract", "introduction",
+    "table of contents", "contents", "cover page", "scan",
+}
+BAD_LINE = re.compile(
+    r"^(?:https?://|www\.|doi\s*[:.]|10\.\d{4,9}/|arxiv\s*[:.]|"
+    r"abstract\b|keywords?\b|introduction\b|references\b|"
+    r"copyright\b|all rights reserved\b|page\s+\d+\b)", re.I
+)
+EMAIL = re.compile(r"\b\S+@\S+\.\S+\b")
+
+
+@dataclass
+class Proposal:
+    source: Path
+    target: Path | None
+    status: str
+    reason: str
+    title_source: str | None = None
+
+    def as_json(self) -> dict[str, str | None]:
+        return {
+            "source": str(self.source),
+            "target": str(self.target) if self.target else None,
+            "status": self.status,
+            "reason": self.reason,
+            "title_source": self.title_source,
+        }
+
 
 def normalize_text(text: str) -> str:
-    """Normalize text and remove unnecessary special characters."""
-    if not text:
-        return "Untitled"
+    """Keep international writing systems while removing control characters."""
+    normalized = unicodedata.normalize("NFKC", str(text))
+    normalized = "".join(
+        " " if ch.isspace() else ch
+        for ch in normalized
+        if ch.isspace() or unicodedata.category(ch) not in {"Cc", "Cf", "Cs"}
+    )
+    return WHITESPACE.sub(" ", normalized).strip()
 
-    text = unicodedata.normalize('NFKD', text).strip()  # Normalize Unicode characters
-    text = re.sub(r'[^\w\s\-.,:;()&%/|+_]', '', text)  # Keep only valid filename characters
-    text = re.sub(r'\s+', ' ', text).strip()  # Remove extra spaces
 
-    return text if len(text) > 3 else "Untitled"
+def plausible_title(text: str) -> bool:
+    value = normalize_text(text).strip(" .-_:;")
+    is_cjk = any("CJK" in unicodedata.name(ch, "") or "HANGUL" in unicodedata.name(ch, "") for ch in value)
+    if len(value) < (2 if is_cjk else 5) or len(value) > 240:
+        return False
+    if value.casefold() in BAD_TITLES or BAD_LINE.search(value) or EMAIL.search(value):
+        return False
+    if re.fullmatch(r"[\d\W_]+", value, re.UNICODE):
+        return False
+    if value.casefold().startswith(("microsoft word -", "adobe indesign", "powerpoint")):
+        return False
+    return True
 
-def get_pdf_title_metadata(pdf_path: Path) -> str:
-    """Extract title from PDF metadata."""
-    try:
-        reader = PdfReader(pdf_path)
-        metadata = reader.metadata
-        title = metadata.get('/Title', '')
 
-        # Remove common irrelevant titles
-        if title and not any(phrase in title.lower() for phrase in ["paper title", "draft", "untitled"]):
-            return normalize_text(title)
-    except Exception as e:
-        logging.error(f"Error reading metadata from {pdf_path}: {e}")
+def sanitize_filename(title: str, max_bytes: int = MAX_TITLE_BYTES) -> str:
+    """Produce a portable PDF stem within a UTF-8 byte budget."""
+    value = normalize_text(title)
+    value = INVALID_CHARS.sub("-", value)
+    value = WHITESPACE.sub(" ", value).strip(" .-_")
+    if WINDOWS_DEVICES.fullmatch(value):
+        value = f"_{value}"
+    if value in {"", ".", ".."}:
+        return ""
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    # Keep a readable prefix without breaking UTF-8 or leaving punctuation.
+    prefix: list[str] = []
+    used = 0
+    for char in value:
+        length = len(char.encode("utf-8"))
+        if used + length > max_bytes:
+            break
+        prefix.append(char)
+        used += length
+    return "".join(prefix).rstrip(" .-_")
 
-    return None
 
-def get_pdf_title_text(pdf_path: Path) -> str:
-    """Extract the first meaningful text from the PDF."""
-    try:
-        doc = fitz.open(pdf_path)
-        for page_num in range(min(len(doc), 3)):  # Scan the first 3 pages
-            text = doc.load_page(page_num).get_text("text")
-            if text:
-                for line in text.split("\n"):
-                    cleaned_line = normalize_text(line)
-                    if len(cleaned_line) > 4 and not re.match(r'^\d{4}$', cleaned_line):  # Avoid year-only titles
-                        doc.close()
-                        return cleaned_line
-        doc.close()
-    except Exception as e:
-        logging.error(f"Error extracting text from {pdf_path}: {e}")
-
-    return None
-
-def get_pdf_title_using_regex(pdf_path: Path) -> str:
-    """Use regex to extract a title from the PDF."""
-    try:
-        doc = fitz.open(pdf_path)
-        for page_num in range(min(len(doc), 3)):
-            text = doc.load_page(page_num).get_text("text")
-            if text:
-                title_pattern = r"^[A-Za-z0-9\s\-_&,:;.!?()]+$"
-                for line in text.split("\n"):
-                    cleaned_line = normalize_text(line)
-                    if re.match(title_pattern, cleaned_line) and len(cleaned_line) > 5:
-                        doc.close()
-                        return cleaned_line
-        doc.close()
-    except Exception as e:
-        logging.error(f"Error using regex on {pdf_path}: {e}")
-
-    return None
-
-def extract_best_title(pdf_path: Path) -> str:
-    """Determine the best title from metadata, text, or regex."""
-    title = get_pdf_title_metadata(pdf_path)
-    if title:
-        return title
-
-    title = get_pdf_title_text(pdf_path)
-    if title:
-        return title
-
-    title = get_pdf_title_using_regex(pdf_path)
-    if title:
-        return title
-
-    return pdf_path.stem  # Default to filename if all else fails
-
-def sanitize_filename(title: str) -> str:
-    """Ensure filenames are valid and do not cut off mid-word."""
-    title = re.sub(r'[<>:"/\\|?*]', '_', title)  # Replace invalid characters
-
-    if len(title) > MAX_FILENAME_LENGTH:
-        words = title.split()
-        new_title = ""
-        for word in words:
-            if len(new_title) + len(word) + 1 <= MAX_FILENAME_LENGTH:
-                new_title += f"{word} "
-            else:
-                break
-        title = new_title.strip()  # Trim at a full word boundary
-
-    return title
-
-def rename_pdf(pdf_path: Path, existing_titles: defaultdict) -> Path:
-    """Rename the PDF while avoiding duplicate filenames."""
-    title = extract_best_title(pdf_path)
-    safe_title = sanitize_filename(title)
-
-    if not safe_title or safe_title.lower() == "untitled":
-        return pdf_path  # Don't rename if the title is invalid
-
-    base_name = f"{safe_title}.pdf"
-    counter = existing_titles[base_name]
-    existing_titles[base_name] += 1
-
-    if counter > 0:
-        base_name = f"{safe_title}_{counter}.pdf"
-
-    return pdf_path.parent / base_name
-
-def rename_pdfs_in_directory(directory: str):
-    """Process and rename all PDFs in a directory."""
-    directory = Path(directory)
-
-    if not directory.exists():
-        logging.error(f"Error: Directory {directory} does not exist.")
-        return
-
-    pdf_files = list(directory.rglob("*.pdf"))  # Search PDFs recursively
-    existing_titles = defaultdict(int)
-
-    for pdf_file in pdf_files:
-        if not pdf_file.exists():
-            logging.warning(f"Skipping {pdf_file}: File not found.")
+def _page_candidates(page: fitz.Page) -> list[tuple[float, float, str]]:
+    """Return prominent line candidates from the upper part of page one."""
+    candidates: list[tuple[float, float, str]] = []
+    blocks = page.get_text("dict").get("blocks", [])
+    for block in blocks:
+        if "lines" not in block:
             continue
+        for line in block["lines"]:
+            spans = line.get("spans", [])
+            text = normalize_text("".join(s.get("text", "") for s in spans))
+            if not plausible_title(text):
+                continue
+            y = float(line["bbox"][1])
+            if y < 0 or y > page.rect.height * 0.67:
+                continue
+            size = max((float(s.get("size", 0)) for s in spans), default=0)
+            candidates.append((size, y, text))
+    return candidates
 
-        print(f"Processing: {pdf_file.name}")
-        new_pdf_path = rename_pdf(pdf_file, existing_titles)
 
-        if new_pdf_path != pdf_file and not new_pdf_path.exists():
-            try:
-                os.rename(pdf_file, new_pdf_path)
-                print(f"Renamed: {pdf_file.name} -> {new_pdf_path.name}")
-            except Exception as e:
-                logging.error(f"Error renaming {pdf_file.name}: {e}")
+def title_from_page(page: fitz.Page) -> str | None:
+    candidates = _page_candidates(page)
+    if not candidates:
+        return None
+    # Large display type is a better signal than the first text line.
+    # Among similarly sized lines, prefer the earlier location.
+    candidates.sort(key=lambda row: (-row[0], row[1]))
+    size, y, text = candidates[0]
+    continuations = [
+        (other_y, other_text)
+        for other_size, other_y, other_text in candidates[1:]
+        if abs(other_size - size) <= max(1.0, size * 0.12)
+        and 0 < other_y - y <= size * 3.4
+    ]
+    if continuations:
+        next_y, next_text = min(continuations)
+        if len(text) + len(next_text) + 1 <= 180:
+            text = f"{text} {next_text}"
+    return text
+
+
+def extract_title(pdf_path: Path) -> tuple[str | None, str | None, str]:
+    """Return (title, origin, reason). No OCR or external services."""
+    try:
+        with fitz.open(pdf_path) as document:
+            if document.needs_pass:
+                return None, None, "password-protected PDF"
+            metadata = document.metadata or {}
+            meta_title = normalize_text(metadata.get("title") or "")
+            if plausible_title(meta_title):
+                return meta_title, "metadata", ""
+            if document.page_count == 0:
+                return None, None, "empty PDF"
+            title = title_from_page(document[0])
+            if title:
+                return title, "page typography", ""
+            # Fallback when the PDF has no usable font-size structure.
+            for page in document:
+                if page.number >= 3:
+                    break
+                for line in page.get_text("text").splitlines():
+                    value = normalize_text(line)
+                    if plausible_title(value):
+                        return value, "page text (low confidence)", ""
+            return None, None, "no extractable title (image-only PDFs need OCR)"
+    except Exception as exc:
+        return None, None, f"PDF could not be read: {type(exc).__name__}: {exc}"
+
+
+def discover_pdfs(paths: Iterable[Path], recursive: bool) -> list[Path]:
+    """Resolve selected paths without following or renaming symlinked files."""
+    found: dict[str, Path] = {}
+    for item in paths:
+        if not item.exists():
+            raise ValueError(f"Path does not exist: {item}")
+        if item.is_symlink():
+            raise ValueError(f"Symlink inputs are unsupported: {item}")
+        if item.is_file():
+            if item.suffix.casefold() != ".pdf":
+                raise ValueError(f"Not a PDF file: {item}")
+            candidates = [item]
+        elif item.is_dir():
+            candidates = item.rglob("*") if recursive else item.iterdir()
         else:
-            print(f"Skipping: {pdf_file.name} (No change or already exists)")
+            raise ValueError(f"Not a regular file or directory: {item}")
+        for candidate in candidates:
+            if candidate.suffix.casefold() != ".pdf" or candidate.is_symlink() or not candidate.is_file():
+                continue
+            absolute = candidate.absolute()
+            found[str(absolute)] = absolute
+    return sorted(found.values(), key=lambda item: (str(item.parent).casefold(), item.name.casefold(), item.name))
 
-# Example usage
-directory = "./"  # Change this to your folder path
-rename_pdfs_in_directory(directory)
+
+def build_plan(files: Iterable[Path], max_bytes: int = MAX_TITLE_BYTES) -> list[Proposal]:
+    reserved: dict[Path, set[str]] = {}
+    proposals: list[Proposal] = []
+    for path in files:
+        parent = path.parent
+        if parent not in reserved:
+            # Reserve every current entry, not just PDFs, and account for case-insensitive FS.
+            reserved[parent] = {entry.name.casefold() for entry in parent.iterdir()}
+        title, origin, reason = extract_title(path)
+        if not title:
+            proposals.append(Proposal(path, None, "skipped", reason))
+            continue
+        safe = sanitize_filename(title, max_bytes)
+        if not safe:
+            proposals.append(Proposal(path, None, "skipped", "title cannot form a safe filename", origin))
+            continue
+        if path.stem.casefold() == safe.casefold() and path.suffix.casefold() == ".pdf":
+            proposals.append(Proposal(path, path, "unchanged", "already named", origin))
+            continue
+        name = f"{safe}.pdf"
+        suffix_index = 2
+        while name.casefold() in reserved[parent]:
+            suffix = f" ({suffix_index})"
+            cut = sanitize_filename(safe, max_bytes - len(suffix.encode("utf-8")))
+            name = f"{cut}{suffix}.pdf"
+            suffix_index += 1
+        reserved[parent].add(name.casefold())
+        proposals.append(Proposal(path, parent / name, "planned", "", origin))
+    return proposals
+
+
+def apply_plan(proposals: list[Proposal]) -> None:
+    """Hard-link exclusively, then unlink: no overwrite even if a target appears mid-run.
+
+    Hard-link creation is atomic with respect to target existence. Unsupported
+    filesystems report an error rather than falling back to an unsafe overwrite.
+    """
+    for proposal in proposals:
+        if proposal.status != "planned" or proposal.target is None:
+            continue
+        try:
+            if proposal.source.is_symlink() or not proposal.source.is_file():
+                raise OSError("source is not a regular PDF file")
+            os.link(proposal.source, proposal.target, follow_symlinks=False)
+        except OSError as exc:
+            proposal.status = "error"
+            proposal.reason = f"could not create destination safely: {exc}"
+            continue
+        try:
+            proposal.source.unlink()
+        except OSError as exc:
+            # Retain the source, attempt to remove only the newly created link.
+            try:
+                proposal.target.unlink()
+                proposal.reason = f"could not remove source: {exc}; destination rolled back"
+            except OSError as rollback_error:
+                proposal.reason = (
+                    f"could not remove source: {exc}; both paths may exist; "
+                    f"rollback failed: {rollback_error}"
+                )
+            proposal.status = "error"
+        else:
+            proposal.status = "renamed"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Rename PDFs from their titles. Preview is the default; --apply changes files."
+    )
+    parser.add_argument("paths", nargs="*", type=Path, default=[Path(".")], help="PDF files or folders (default: current directory)")
+    parser.add_argument("--apply", action="store_true", help="perform the planned renames")
+    parser.add_argument("--no-recursive", action="store_true", help="only scan the top level of supplied folders")
+    parser.add_argument("--max-title-bytes", type=int, default=MAX_TITLE_BYTES, metavar="N", help="maximum UTF-8 bytes in filename stem (40-200)")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable results")
+    args = parser.parse_args(argv)
+    if not 40 <= args.max_title_bytes <= 200:
+        parser.error("--max-title-bytes must be between 40 and 200")
+    try:
+        files = discover_pdfs(args.paths, recursive=not args.no_recursive)
+        plan = build_plan(files, max_bytes=args.max_title_bytes)
+    except (OSError, ValueError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+    if args.apply:
+        apply_plan(plan)
+    if args.json:
+        print(json.dumps([item.as_json() for item in plan], ensure_ascii=False, indent=2))
+    else:
+        for item in plan:
+            target = f" -> {item.target.name}" if item.target and item.status in {"planned", "renamed"} else ""
+            detail = f" ({item.reason})" if item.reason else ""
+            print(f"{item.status.upper()}: {item.source}{target}{detail}")
+        counts = {status: sum(p.status == status for p in plan) for status in ("planned", "renamed", "unchanged", "skipped", "error")}
+        print(f"Total: {len(plan)} | " + " | ".join(f"{key}: {value}" for key, value in counts.items() if value))
+        if not args.apply and counts["planned"]:
+            print("Preview only. Pass --apply to rename files.")
+    return 1 if any(p.status == "error" for p in plan) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
