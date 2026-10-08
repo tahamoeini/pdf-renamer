@@ -103,6 +103,7 @@ def test_two_files_same_title_do_not_collide(tmp_path):
     apply_plan(plan)
     assert all(p.status == "renamed" for p in plan)
     assert len(list(tmp_path.glob("*.pdf"))) == 2
+    assert all(p.status == "unchanged" for p in build_plan(sorted(tmp_path.glob("*.pdf"))))
 
 
 def test_existing_target_that_appears_after_planning_is_never_overwritten(tmp_path):
