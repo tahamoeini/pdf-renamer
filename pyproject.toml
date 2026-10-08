@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-title-renamer"
+version = "0.2.0"
+description = "Offline, review-first batch renaming of PDF files from document titles"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["PyMuPDF>=1.24,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pdf-renamer = "rename:main"
+
+[tool.setuptools]
+py-modules = ["rename"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
