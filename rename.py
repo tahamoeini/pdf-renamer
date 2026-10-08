@@ -209,7 +209,13 @@ def build_plan(files: Iterable[Path], max_bytes: int = MAX_TITLE_BYTES) -> list[
         if not safe:
             proposals.append(Proposal(path, None, "skipped", "title cannot form a safe filename", origin))
             continue
-        if path.stem.casefold() == safe.casefold() and path.suffix.casefold() == ".pdf":
+        # A numbered collision name is stable across repeated runs.
+        collision_stem = re.fullmatch(r"(.+) \(([2-9]\d*)\)", path.stem)
+        stem_matches = path.stem.casefold() == safe.casefold() or (
+            collision_stem is not None
+            and collision_stem.group(1).casefold() == safe.casefold()
+        )
+        if stem_matches and path.suffix.casefold() == ".pdf":
             proposals.append(Proposal(path, path, "unchanged", "already named", origin))
             continue
         name = f"{safe}.pdf"
